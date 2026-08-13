@@ -1,0 +1,27 @@
+# Manual-only Go tests against MySQL 8.4.11.
+# Intended for forks that do not have Fleet's ubuntu-8core runners or org secrets.
+# Does not run on push, pull_request, or cron.
+name: Go Tests (MySQL 8.4.11)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test-go-mysql-8411:
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ["integration-core", "integration-enterprise", "integration-mdm", "fleetctl", "main", "mysql", "service", "vuln"]
+    uses: ./.github/workflows/test-go-suite.yaml
+    with:
+      suite: ${{ matrix.suite }}
+      mysql: "mysql:8.4.11"
+      is_cron: false
+      runs_on: ubuntu-latest
