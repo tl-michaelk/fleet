@@ -1,5 +1,5 @@
 # Reusable workflow for running a single Go test suite.
-# Called by test-go.yaml with different matrix configurations.
+# Called by test-go.yaml (and other callers) with different matrix configurations.
 name: Test Go suite
 
 on:
@@ -34,6 +34,11 @@ on:
         required: false
         type: boolean
         default: false
+      runs_on:
+        description: 'GitHub Actions runner label. Default is Fleet''s 8-core runner; forks without that label should pass ubuntu-latest.'
+        required: false
+        type: string
+        default: ubuntu-8core
     secrets:
       FLEET_RELEASE_GITHUB_PAT:
         description: 'GitHub PAT used as NETWORK_TEST_GITHUB_TOKEN for tests that hit the GitHub API.'
@@ -55,7 +60,7 @@ jobs:
     # Don't cancel other jobs if one test suite fails. Since our product teams are tightly coupled, we never want to see our tests fail due
     # to an unrelated issue in another product area.
     continue-on-error: true
-    runs-on: ubuntu-8core
+    runs-on: ${{ inputs.runs_on }}
 
     env:
       RACE_ENABLED: false
