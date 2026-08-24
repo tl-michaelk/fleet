@@ -24,6 +24,7 @@ import (
 	"math/big"
 	"mime/multipart"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -54,10 +55,12 @@ import (
 	"github.com/fleetdm/fleet/v4/server/pubsub"
 	"github.com/golang-jwt/jwt/v4"
 	"google.golang.org/api/androidmanagement/v1"
+	"google.golang.org/api/googleapi"
 
 	svc_scep "github.com/fleetdm/fleet/v4/ee/server/service/scep"
 	"github.com/fleetdm/fleet/v4/pkg/file"
 	"github.com/fleetdm/fleet/v4/pkg/fleetdbase"
+	"github.com/fleetdm/fleet/v4/pkg/fleethttp"
 	shared_mdm "github.com/fleetdm/fleet/v4/pkg/mdm"
 	"github.com/fleetdm/fleet/v4/pkg/mdm/mdmtest"
 	"github.com/fleetdm/fleet/v4/pkg/optjson"
@@ -558,6 +561,7 @@ func (s *integrationMDMTestSuite) SetupSuite() {
 	// This is a bit of a code smell but I don't see a better way to initialize this for the tests. The
 	// initialization pattern works fine in our normal fleet server setup
 	appleMDMJob.VPPInstaller = svc
+	appleMDMJob.InHouseAppInstaller = svc
 
 	users, server := RunServerForTestsWithServiceWithDS(s.T(), ctx, s.ds, svc, &serverConfig)
 
@@ -1077,9 +1081,43 @@ func (s *integrationMDMTestSuite) TearDownTest() {
 	s.androidAPIClient.EnterprisesDevicesPatchFuncInvoked = false
 }
 
+// withDEPDeviceDetails answers Apple's "Get Device Details" endpoint, which host
+// deletion consults to tell a device released from Apple Business apart from one
+// Fleet still owns. Every requested serial is reported as still assigned, which is
+// the state these suites set up; without this the lookup fails and deletes are
+// refused. Tests needing a different answer should serve /devices themselves and
+// bypass this wrapper.
+func withDEPDeviceDetails(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/devices" {
+			handler.ServeHTTP(w, r)
+			return
+		}
+
+		var req struct {
+			Devices []string `json:"devices"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			// Fail loudly rather than answering an unreadable request, so a client
+			// regression shows up here instead of as a puzzling downstream result.
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		devices := make(map[string]any, len(req.Devices))
+		for _, serial := range req.Devices {
+			devices[serial] = map[string]any{"serial_number": serial, "response_status": "SUCCESS"}
+		}
+		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(map[string]any{"devices": devices}); err != nil {
+			panic(err)
+		}
+	})
+}
+
 func (s *integrationMDMTestSuite) mockDEPResponse(orgName string, handler http.Handler) {
 	t := s.T()
-	srv := httptest.NewServer(handler)
+	srv := httptest.NewServer(withDEPDeviceDetails(handler))
 	err := s.depStorage.StoreConfig(context.Background(), orgName, &nanodep_client.Config{BaseURL: srv.URL})
 	depSvc := apple_mdm.NewDEPService(s.ds, s.depStorage, s.logger)
 	require.NoError(t, depSvc.CreateDefaultAutomaticProfile(context.Background()))
@@ -1765,15 +1803,22 @@ func (s *integrationMDMTestSuite) createWindowsHostThenEnrollMDMViaSettingsApp(f
 
 // Note that this method only creates the MDM Enrollment but it will still need to be linked to the host record either
 // via DS methods or by simualting a refetch.
-func (s *integrationMDMTestSuite) enrollWindowsMDMViaSettingsApp(fleetServerURL, email, tenantID string) *mdmtest.TestWindowsMDMClient {
-	mdmDevice := mdmtest.NewTestMDMClientWindowsAutomatic(fleetServerURL, email, mdmtest.TestWindowsMDMClientNotInOOBE(), mdmtest.TestWindowsMDMClientWithSigningKeyAndTenantID(s.jwtSigningKey, defaultFakeJWTKeyID, tenantID))
+func (s *integrationMDMTestSuite) enrollWindowsMDMViaSettingsApp(fleetServerURL, email, tenantID string, opts ...mdmtest.TestWindowsMDMClientOption) *mdmtest.TestWindowsMDMClient {
+	opts = append([]mdmtest.TestWindowsMDMClientOption{
+		mdmtest.TestWindowsMDMClientNotInOOBE(),
+		mdmtest.TestWindowsMDMClientWithSigningKeyAndTenantID(s.jwtSigningKey, defaultFakeJWTKeyID, tenantID),
+	}, opts...)
+	mdmDevice := mdmtest.NewTestMDMClientWindowsAutomatic(fleetServerURL, email, opts...)
 	err := mdmDevice.Enroll()
 	require.NoError(s.T(), err)
 	return mdmDevice
 }
 
-func (s *integrationMDMTestSuite) enrollWindowsHostInMDMViaAutopilot(fleetServerURL, email, tenantID string) *mdmtest.TestWindowsMDMClient {
-	mdmDevice := mdmtest.NewTestMDMClientWindowsAutomatic(fleetServerURL, email, mdmtest.TestWindowsMDMClientWithSigningKeyAndTenantID(s.jwtSigningKey, defaultFakeJWTKeyID, tenantID))
+func (s *integrationMDMTestSuite) enrollWindowsHostInMDMViaAutopilot(fleetServerURL, email, tenantID string, opts ...mdmtest.TestWindowsMDMClientOption) *mdmtest.TestWindowsMDMClient {
+	opts = append([]mdmtest.TestWindowsMDMClientOption{
+		mdmtest.TestWindowsMDMClientWithSigningKeyAndTenantID(s.jwtSigningKey, defaultFakeJWTKeyID, tenantID),
+	}, opts...)
+	mdmDevice := mdmtest.NewTestMDMClientWindowsAutomatic(fleetServerURL, email, opts...)
 	err := mdmDevice.Enroll()
 	require.NoError(s.T(), err)
 	return mdmDevice
@@ -6887,6 +6932,9 @@ func (s *integrationMDMTestSuite) TestSSO() {
 	require.False(t, q.Has("profile_token"))
 	require.False(t, q.Has("enrollment_reference"))
 	require.True(t, q.Has("error"))
+	// No session cookie is sent, so the session lookup fails before the
+	// SAMLResponse is ever parsed.
+	require.Equal(t, "session_expired", q.Get("reason"))
 
 	// hitting the callback with an invalid session id redirects the user to the UI
 	rawSSOResp = `<?xml version="1.0" encoding="UTF-8"?>
@@ -6902,6 +6950,32 @@ func (s *integrationMDMTestSuite) TestSSO() {
 	require.False(t, q.Has("profile_token"))
 	require.False(t, q.Has("enrollment_reference"))
 	require.True(t, q.Has("error"))
+	// No session cookie was sent, so the session lookup is what failed. The UI
+	// uses this to tell the end user their sign-in timed out.
+	require.Equal(t, "session_expired", q.Get("reason"))
+
+	// With a live session, a SAMLResponse that can't be verified is a different
+	// failure. The user hasn't run out of time, so the timeout message would be
+	// wrong -- this stays generic.
+	prevCookieSecure := cookieSecure
+	t.Cleanup(func() { cookieSecure = prevCookieSecure })
+	cookieSecure = false
+	jar, err := cookiejar.New(nil)
+	require.NoError(t, err)
+	client := fleethttp.NewClient(fleethttp.WithFollowRedir(false), fleethttp.WithCookieJar(jar))
+
+	var resIni initiateSSOResponse
+	iniRes := s.doWithClient(client, "POST", "/api/v1/fleet/mdm/sso", []byte(`{}`), http.StatusOK, nil)
+	require.NoError(t, json.NewDecoder(iniRes.Body).Decode(&resIni))
+	require.NoError(t, resIni.Error())
+
+	res = s.doWithClient(client, "POST", "/api/v1/fleet/mdm/sso/callback", nil, http.StatusSeeOther, nil,
+		"SAMLResponse", base64.StdEncoding.EncodeToString([]byte(`InvalidXML`)))
+	u, err = url.Parse(res.Header.Get("Location"))
+	require.NoError(t, err)
+	q = u.Query()
+	require.True(t, q.Has("error"))
+	require.False(t, q.Has("reason"))
 }
 
 // TestMDMSSOReenrollWithDifferentIdPEmail is a regression test for
@@ -13462,6 +13536,31 @@ func (s *integrationMDMTestSuite) TestEnrollAfterDEPSyncIOSIPadOS() {
 	require.Empty(t, listCmdResp.Results)
 }
 
+// assertHostMDMCertificates checks the certificates the host details API reports
+// against the templates the device answered CertificateList with. A refetch on
+// the device channel only ever sees the system keychain.
+func (s *integrationMDMTestSuite) assertHostMDMCertificates(t *testing.T, hostID uint, templates []*x509.Certificate) {
+	t.Helper()
+	var resp listHostCertificatesResponse
+	s.DoJSON("GET", fmt.Sprintf("/api/latest/fleet/hosts/%d/certificates", hostID), nil, http.StatusOK, &resp)
+	require.Len(t, resp.Certificates, len(templates))
+	bySerial := make(map[string]*fleet.HostCertificatePayload, len(resp.Certificates))
+	for _, c := range resp.Certificates {
+		bySerial[c.Serial] = c
+	}
+	for _, tmpl := range templates {
+		serial := tmpl.SerialNumber.Text(16)
+		got, ok := bySerial[serial]
+		require.True(t, ok, "no certificate reported with serial %s", serial)
+		require.Equal(t, fleet.SystemHostCertificate, got.Source)
+		require.Empty(t, got.Username)
+		require.WithinDuration(t, tmpl.NotBefore, got.NotValidBefore, time.Second)
+		require.WithinDuration(t, tmpl.NotAfter, got.NotValidAfter, time.Second)
+		require.NotNil(t, got.Subject)
+		require.Equal(t, tmpl.Subject.Organization[0], got.Subject.Organization)
+	}
+}
+
 func (s *integrationMDMTestSuite) TestRefetchIOSIPadOS() {
 	t := s.T()
 
@@ -13554,7 +13653,7 @@ func (s *integrationMDMTestSuite) TestRefetchIOSIPadOS() {
 	}
 	assert.ElementsMatch(t, expectedSoftware, hostResp.Host.Software)
 
-	// TODO: add test for GET /hosts/:id/certificates endpoint, should match up with testCerts
+	s.assertHostMDMCertificates(t, host.ID, testCerts)
 
 	// Install the same app for iPadOS
 	hostIPad, mdmClientIPad := s.createAppleMobileHostThenEnrollMDM("ipados")
@@ -13606,7 +13705,7 @@ func (s *integrationMDMTestSuite) TestRefetchIOSIPadOS() {
 	}
 	assert.ElementsMatch(t, expectedSoftware, hostResp.Host.Software)
 
-	// TODO: add test for GET /hosts/:id/certificates endpoint, should match up with testCerts
+	s.assertHostMDMCertificates(t, hostIPad.ID, testCerts)
 
 	hostIPod, mdmClientIPod := s.createIpodHostThenEnrollMDM()
 	require.NoError(t, s.ds.SetOrUpdateMDMData(context.Background(), hostIPod.ID, false, true, "https://foo.com", true, "", "", false))
@@ -17230,7 +17329,7 @@ func (s *integrationMDMTestSuite) TestDigiCertConfig() {
 	// Check 3 added activities are present
 	var listActivities listActivitiesResponse
 	s.DoJSON("GET", "/api/latest/fleet/activities", nil, http.StatusOK,
-		&listActivities, "order_key", "a.id", "order_direction", "desc", "per_page", "10")
+		&listActivities, "order_key", "id", "order_direction", "desc", "per_page", "10")
 	require.True(t, len(listActivities.Activities) > 0)
 	activity := fleet.ActivityAddedDigiCert{}
 	caNames := make([]string, 0, 3)
@@ -17288,7 +17387,7 @@ func (s *integrationMDMTestSuite) TestDigiCertConfig() {
 
 		listActivities = listActivitiesResponse{}
 		s.DoJSON("GET", "/api/latest/fleet/activities", nil, http.StatusOK,
-			&listActivities, "order_key", "a.id", "order_direction", "desc", "per_page", "10")
+			&listActivities, "order_key", "id", "order_direction", "desc", "per_page", "10")
 		require.True(t, len(listActivities.Activities) > 0)
 		activity = fleet.ActivityAddedDigiCert{}
 		editActivity := fleet.ActivityEditedDigiCert{}
@@ -17329,7 +17428,7 @@ func (s *integrationMDMTestSuite) TestDigiCertConfig() {
 		// Check that 3 deleted activities are present
 		listActivities = listActivitiesResponse{}
 		s.DoJSON("GET", "/api/latest/fleet/activities", nil, http.StatusOK,
-			&listActivities, "order_key", "a.id", "order_direction", "desc", "per_page", "10")
+			&listActivities, "order_key", "id", "order_direction", "desc", "per_page", "10")
 		require.True(t, len(listActivities.Activities) > 0)
 		delActivity := fleet.ActivityDeletedDigiCert{}
 		caNames = make([]string, 0, 3)
@@ -18070,7 +18169,7 @@ func (s *integrationMDMTestSuite) TestCustomSCEPConfig() {
 	// Check 3 added activities are present
 	var listActivities listActivitiesResponse
 	s.DoJSON("GET", "/api/latest/fleet/activities", nil, http.StatusOK,
-		&listActivities, "order_key", "a.id", "order_direction", "desc", "per_page", "10")
+		&listActivities, "order_key", "id", "order_direction", "desc", "per_page", "10")
 	require.True(t, len(listActivities.Activities) > 0)
 	activity := fleet.ActivityAddedCustomSCEPProxy{}
 	caNames := make([]string, 0, 3)
@@ -18127,7 +18226,7 @@ func (s *integrationMDMTestSuite) TestCustomSCEPConfig() {
 
 	listActivities = listActivitiesResponse{}
 	s.DoJSON("GET", "/api/latest/fleet/activities", nil, http.StatusOK,
-		&listActivities, "order_key", "a.id", "order_direction", "desc", "per_page", "10")
+		&listActivities, "order_key", "id", "order_direction", "desc", "per_page", "10")
 	require.True(t, len(listActivities.Activities) > 0)
 	activity = fleet.ActivityAddedCustomSCEPProxy{}
 	editActivity := fleet.ActivityEditedCustomSCEPProxy{}
@@ -18167,7 +18266,7 @@ func (s *integrationMDMTestSuite) TestCustomSCEPConfig() {
 		// Check that 3 deleted activities are present
 		listActivities = listActivitiesResponse{}
 		s.DoJSON("GET", "/api/latest/fleet/activities", nil, http.StatusOK,
-			&listActivities, "order_key", "a.id", "order_direction", "desc", "per_page", "10")
+			&listActivities, "order_key", "id", "order_direction", "desc", "per_page", "10")
 		require.True(t, len(listActivities.Activities) > 0)
 		delActivity = fleet.ActivityDeletedCustomSCEPProxy{}
 		caNames = make([]string, 0, 3)
@@ -18966,6 +19065,20 @@ func (s *integrationMDMTestSuite) TestAndroidHostUnenrollMDM() {
 	coboHostMDM, err := s.ds.GetHostMDM(ctx, coboHostID)
 	require.NoError(t, err)
 	require.True(t, coboHostMDM.Enrolled, "host_mdm.enrolled must stay true until the device acks via Pub/Sub DELETED")
+
+	// Reset between sub-cases.
+	didCallAMAPIDelete = false
+	didCallAMAPIIssueWipe = false
+	issuedCommand = nil
+
+	// BYO host where AMAPI returns 404 (device already removed from Google) -> should succeed (204), not 500.
+	s.androidAPIClient.EnterprisesDevicesIssueCommandFunc = func(_ context.Context, _ string, _ *androidmanagement.Command) (*androidmanagement.Operation, error) {
+		didCallAMAPIIssueWipe = true
+		return nil, &googleapi.Error{Code: http.StatusNotFound, Message: "Not Found"}
+	}
+	byoGoneHostID := createAndroidHostForTest(t, s.ds, nil, false)
+	s.Do("DELETE", fmt.Sprintf("/api/latest/fleet/hosts/%d/mdm", byoGoneHostID), nil, http.StatusNoContent)
+	require.True(t, didCallAMAPIIssueWipe, "expected BYO unenroll to attempt IssueCommand even when device is gone")
 }
 
 // TestAndroidLockWipeClearPasscode exercises the three commands end-to-end against the real Fleet HTTP handler stack with a
@@ -25213,7 +25326,7 @@ func (s *integrationMDMTestSuite) TestManagedLocalAccount() {
 		// Auto-rotation activity exists and is FleetInitiated.
 		var fleetActivities listActivitiesResponse
 		s.DoJSON("GET", "/api/latest/fleet/activities", nil, http.StatusOK, &fleetActivities,
-			"order_key", "a.id", "order_direction", "desc", "per_page", "20")
+			"order_key", "id", "order_direction", "desc", "per_page", "20")
 		rotateActivityName := fleet.ActivityTypeRotatedManagedLocalAccountPassword{}.ActivityName()
 		var sawFleetRotation bool
 		for _, a := range fleetActivities.Activities {
