@@ -39,6 +39,11 @@ on:
         required: false
         type: string
         default: ubuntu-8core
+      go_test_timeout:
+        description: 'Go test timeout (e.g. "20m", "2h"). Empty keeps the default (20m, or 1h when is_cron is true).'
+        required: false
+        type: string
+        default: ''
     secrets:
       FLEET_RELEASE_GITHUB_PAT:
         description: 'GitHub PAT used as NETWORK_TEST_GITHUB_TOKEN for tests that hit the GitHub API.'
@@ -130,6 +135,10 @@ jobs:
       run: |
         echo "RACE_ENABLED=true" >> $GITHUB_ENV
         echo "GO_TEST_TIMEOUT=1h" >> $GITHUB_ENV
+
+    - name: Override Go test timeout
+      if: ${{ inputs.go_test_timeout != '' }}
+      run: echo "GO_TEST_TIMEOUT=${{ inputs.go_test_timeout }}" >> $GITHUB_ENV
 
     - name: Checkout Code
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

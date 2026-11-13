@@ -25,3 +25,5 @@ jobs:
       mysql: "mysql:8.4.13"
       is_cron: false
       runs_on: ubuntu-latest
+      # ubuntu-latest is 2 cores vs Fleet's 8-core runners; 20m is not enough for the mysql suite.
+      go_test_timeout: 2h
