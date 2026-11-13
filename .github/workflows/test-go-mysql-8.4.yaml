@@ -1,7 +1,7 @@
-# Manual-only Go tests against MySQL 8.4.11.
+# Manual-only Go tests against MySQL 8.4.13.
 # Intended for forks that do not have Fleet's ubuntu-8core runners or org secrets.
 # Does not run on push, pull_request, or cron.
-name: Go Tests (MySQL 8.4.11)
+name: Go Tests (MySQL 8.4.13)
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 jobs:
-  test-go-mysql-8411:
+  test-go-mysql-8413:
     strategy:
       fail-fast: false
       matrix:
@@ -22,6 +22,6 @@ jobs:
     uses: ./.github/workflows/test-go-suite.yaml
     with:
       suite: ${{ matrix.suite }}
-      mysql: "mysql:8.4.11"
+      mysql: "mysql:8.4.13"
       is_cron: false
       runs_on: ubuntu-latest
